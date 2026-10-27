@@ -22,6 +22,8 @@ profiles side by side and copies or moves a chat, with all its sub-chats, from o
 - **Moves** a chat: copies it, then removes it from the source the way Claude does when you delete a chat. The
   removed files go to a trash folder and can be restored.
 - **Archives** the source copy instead, if you prefer to keep it.
+- **Syncs** every chat at once, in every direction, if you turn it on: each time the app opens or you switch
+  back to it, chats missing from a profile are copied there and older copies are brought up to date.
 - Never overwrites a copy that is further along, and never copies half a group: if any chat in the group
   diverged, nothing happens until you confirm, and the replaced version is kept as a backup.
 
@@ -32,10 +34,17 @@ earlier transcripts.
 ## Requirements
 
 - macOS 14 or later, with Claude Desktop.
-- At least two profiles, each with **both** a Desktop and a Code half, each signed in:
-  your default Claude plus one or more made with
-  [claude-multiprofile](https://github.com/jmdarre-v/claude-multiprofile) (`claude-multiprofile add`,
-  choosing "Both"). Profiles you set up by hand also work: see [Configuration](#configuration).
+- At least two profiles with a Desktop half, each signed in: your default Claude plus one or more made with
+  [claude-multiprofile](https://github.com/jmdarre-v/claude-multiprofile) (`claude-multiprofile add`).
+  Profiles you set up by hand also work: see [Configuration](#configuration).
+  - **Both** (Desktop and Code): the profile has its own Claude Code folder, so a copied chat is a real,
+    separate copy.
+  - **Desktop only**: the profile's Code tab runs Claude Code on the shared `~/.claude`, so its chats'
+    conversations are the same files as your default profile's. Copying only adds the chat to its Code tab,
+    and continuing it in one profile continues it in the other. The catch: **deleting** a chat in one profile
+    deletes its conversation for both (Claude removes the file), so archive instead. Don't run the same chat
+    in both apps at once either. To give the profile its own folder later, run `claude-multiprofile add`,
+    choose Claude Code and the same profile name.
 - The Xcode Command Line Tools, to build the app: `xcode-select --install`.
 - Optional: [Pillow](https://pypi.org/project/pillow/) for the app icon (`pip3 install --user pillow`).
 
@@ -77,6 +86,21 @@ Writing into a profile needs its Claude app closed (quit it with Cmd+Q). The sou
 it is, archiving or removing the source copy is queued and done as soon as that app quits. A queued removal
 is skipped if the chat was continued in the meantime.
 
+### Syncing automatically
+
+Tick **Sync automatically** in **Profiles…**, or press **Sync now** in the sidebar or toolbar. The app then
+syncs the selected profiles each time it opens and each time you switch back to it:
+
+- a chat missing from a profile is copied there (archived if it is archived where it comes from), with its
+  sub-chats;
+- a copy that is behind is brought up to date;
+- a chat continued in two profiles is left alone and shown under **Conflicts**, for you to decide;
+- a chat you deleted in a profile, or moved away from it, is not brought back there;
+- nothing is written into a profile while its Claude app is open: those chats wait, and the sidebar says
+  which app to quit. Quit it, switch back to Claude Chat Sync, and they are copied.
+
+Sync never deletes, archives or overwrites anything that is further along.
+
 **Trash** (bottom of the sidebar) lists moved-away chats; **Restore** puts one back (its profile's app must
 be closed). The files stay in `~/.local/share/claude-chat-sync/trash` until you delete them yourself.
 
@@ -98,6 +122,8 @@ claude-chat list --from work "invoice"               # chats of a profile, filte
 claude-chat copy "invoice" --from default --to work   # a chat and its sub-chats
 claude-chat copy 1a2b3c4d --from default --to work --move
 claude-chat copy 1a2b3c4d --from default --to work --dry-run
+claude-chat sync --dry-run                            # what syncing the shown profiles would do
+claude-chat sync                                      # do it
 claude-chat trash list
 claude-chat trash restore <entry>
 claude-chat pending list
@@ -116,16 +142,25 @@ machine-readable output. Exit codes: 3 = the destination app is open, 4 = some c
 {
   "show": ["default", "work"],
   "names": { "default": "Personal", "work": "Work" },
-  "profiles": [
-    { "key": "client", "dataDir": "~/Library/Application Support/Claude-Client", "configDir": "~/.claude-client" }
-  ]
+  "autoSync": true
 }
 ```
 
 - `show`: the profiles to compare, at most three (default: the first three found).
 - `names`: display names. Profile keys are `default` and the claude-multiprofile profile names.
-- `profiles`: profiles made by hand, without claude-multiprofile: the Desktop data folder you start Claude
-  with (`--user-data-dir`) and the `CLAUDE_CONFIG_DIR` you use for its Claude Code.
+- `autoSync`: sync the shown profiles when the app opens and when you switch back to it (default: off).
+- `profiles`: only for profiles made **by hand**, without claude-multiprofile. Profiles made with
+  claude-multiprofile are found on their own: don't list them here. Each entry gives the Desktop data folder
+  you start Claude with (`--user-data-dir`) and, if its Claude Code has its own folder, the
+  `CLAUDE_CONFIG_DIR` you use for it (leave `configDir` out when it shares `~/.claude`):
+
+  ```json
+  "profiles": [
+    { "key": "client", "dataDir": "~/Library/Application Support/Claude-Client", "configDir": "~/.claude-client" }
+  ]
+  ```
+
+  An entry whose Desktop folder is already another profile's is ignored.
 
 ## How it works
 
@@ -142,6 +177,10 @@ Copying copies all of them and points the card's paths at the new profile; refer
 (Remote Control, connectors, Chrome tab group) are left out. Copies are compared byte by byte: a copy whose
 conversation is the start of another's is *behind*, anything else is *diverged*. Removing a chat moves these
 files to the trash and leaves the `deleted_<transcript id>` marker Claude itself writes when you delete a chat.
+
+Profiles that share a Claude Code folder (a Desktop-only profile and your default one) share the
+conversation, checkpoint and transcript-folder pieces: copying a chat between them copies only the card and
+the shared notes, and removing it from one takes only those away, leaving the conversation for the other.
 
 Claude Chat Sync stores only its own settings (`~/.config/claude-chat-sync`), its trash
 (`~/.local/share/claude-chat-sync`) and a comparison cache (`~/.cache/claude-chat-sync`). It never reads or

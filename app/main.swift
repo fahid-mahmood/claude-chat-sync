@@ -66,9 +66,15 @@ struct ProfileInfo: Decodable, Identifiable, Hashable {
     let codeEmail: String?
     let accountMismatch: Bool
     let error: String?
+    let appName: String?   // the launcher's name, e.g. "Claude WORK"
+    let codeDir: String?   // its Claude Code folder: ~/.claude for the default and Desktop-only profiles
     var id: String { key }
 
-    var app: String { key == "default" ? "Claude" : "Claude \(name)" }
+    var app: String { appName ?? (key == "default" ? "Claude" : "Claude \(name)") }
+    var origin: String {
+        if key == "default" { return "default Claude" }
+        return "claude-multiprofile: \(key)" + (codeDir == "~/.claude" ? " · Desktop only" : "")
+    }
 }
 
 struct Side: Decodable, Hashable {
@@ -106,6 +112,23 @@ struct Item: Decodable, Identifiable, Hashable {
 struct Status: Decodable {
     let profiles: [ProfileInfo]
     let chats: [Item]
+}
+
+struct SyncReport: Decodable {
+    struct Line: Decodable {
+        let sessionId: String
+        let title: String?
+        let to: String?
+        let result: String  // copied, updated, waiting, conflict, deleted, moved, parent, mismatch
+    }
+    let chats: [Line]
+    let errors: [String: String]
+}
+
+struct SyncRun {
+    let report: SyncReport?
+    let error: String?
+    let at: Date
 }
 
 struct TrashEntry: Decodable, Identifiable {
@@ -261,10 +284,69 @@ final class Store: ObservableObject {
     @Published var confirming: CopyRequest?
     @Published var showSettings = false
     @Published var showTrash = false
+    @Published var autoSync = false
+    @Published var syncing = false
+    @Published var lastSync: SyncRun?
+    @Published private(set) var refreshing = false
 
     func color(_ key: String) -> Color {
         let i = profiles.firstIndex { $0.key == key } ?? 0
         return Palette.named(profiles.first { $0.key == key }?.color) ?? Palette.profileColors[i % 3]
+    }
+
+    func profile(_ key: String?) -> ProfileInfo? { (allProfiles + profiles).first { $0.key == key } }
+
+    func loadConfig() {
+        let cfg = (try? JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: configFile)))) as? [String: Any]
+        autoSync = cfg?["autoSync"] as? Bool ?? false
+    }
+
+    /// Re-reads everything, syncing first when auto-sync is on or `sync` asks for it. Opening the app and
+    /// switching back to it both land here, so one run at a time: two syncs must never write at once.
+    func refresh(sync: Bool = false) async {
+        guard !refreshing else { return }
+        refreshing = true
+        defer { refreshing = false }
+        loadConfig()
+        if (sync || autoSync) && !busy {
+            busy = true
+            syncing = true
+            let r = await runTool(["sync", "--json"])
+            if r.code == 0, let rep = try? JSONDecoder().decode(SyncReport.self, from: Data(r.out.utf8)) {
+                lastSync = SyncRun(report: rep, error: nil, at: Date())
+            } else {
+                lastSync = SyncRun(report: nil, error: clean(r.err.isEmpty ? "claude-chat sync failed (\(r.code))" : r.err),
+                                   at: Date())
+            }
+            syncing = false
+            busy = false
+        }
+        await reload()
+    }
+
+    /// The last sync in a few lines, each with its colour
+    var syncNotes: [(text: String, color: Color)] {
+        guard let run = lastSync else { return [] }
+        guard let rep = run.report else { return [(run.error ?? "Sync failed", Palette.red)] }
+        func byTarget(_ results: Set<String>) -> [(String, Int)] {
+            Dictionary(grouping: rep.chats.filter { results.contains($0.result) }) { $0.to ?? "" }
+                .map { ($0.key, $0.value.count) }.sorted { $0.0 < $1.0 }
+        }
+        func chats(_ n: Int) -> String { n == 1 ? "1 chat" : "\(n) chats" }
+        var out: [(text: String, color: Color)] = []
+        for (to, n) in byTarget(["copied", "updated"]) {
+            out.append(("\(chats(n)) synced to \(profile(to)?.name ?? to)", Palette.green))
+        }
+        for (to, n) in byTarget(["waiting"]) {
+            let p = profile(to)
+            out.append(("\(chats(n)) to bring into \(p?.name ?? to): quit \(p?.app ?? "Claude") (Cmd+Q)", Palette.amber))
+        }
+        let conflicts = rep.chats.filter { $0.result == "conflict" }.count
+        if conflicts > 0 { out.append(("\(chats(conflicts)) continued in more than one profile: see Conflicts", Palette.red)) }
+        let left = rep.chats.filter { ["deleted", "moved", "parent", "mismatch"].contains($0.result) }.count
+        if left > 0 { out.append(("\(chats(left)) left out: deleted or moved away in a profile", Palette.secondary)) }
+        for (k, e) in rep.errors.sorted(by: { $0.key < $1.key }) { out.append(("\(profile(k)?.name ?? k): \(e)", Palette.red)) }
+        return out.isEmpty ? [("Everything is in sync", Palette.green)] : out
     }
 
     func reload() async {
@@ -282,6 +364,7 @@ final class Store: ObservableObject {
     }
 
     func copy(_ req: CopyRequest, force: Bool = false) async {
+        guard !busy else { return }  // a sync is writing
         busy = true
         defer { busy = false }
         var args = ["copy", req.sourceSessionId, "--from", req.from.key, "--to", req.to.key, "--json"]
@@ -334,16 +417,17 @@ final class Store: ObservableObject {
         await reload()
     }
 
-    func saveSettings(show: [String], names: [String: String]) async {
+    func saveSettings(show: [String], names: [String: String], autoSync: Bool) async {
         var cfg = (try? JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: configFile)))) as? [String: Any] ?? [:]
         cfg["show"] = show
         cfg["names"] = names.filter { !$0.value.trimmingCharacters(in: .whitespaces).isEmpty }
+        cfg["autoSync"] = autoSync
         try? FileManager.default.createDirectory(atPath: (configFile as NSString).deletingLastPathComponent,
                                                  withIntermediateDirectories: true)
         if let data = try? JSONSerialization.data(withJSONObject: cfg, options: [.prettyPrinted, .sortedKeys]) {
             try? data.write(to: URL(fileURLWithPath: configFile))
         }
-        await reload()
+        await refresh()
     }
 }
 
@@ -415,6 +499,38 @@ struct ProfileCard: View {
     }
 }
 
+struct SyncCard: View {
+    @ObservedObject var store: Store
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .foregroundStyle(store.autoSync ? Palette.green : Palette.secondary)
+                Text(store.autoSync ? "Auto-sync on" : "Auto-sync off").fontWeight(.semibold)
+                Spacer()
+                Button("Sync now") { Task { await store.refresh(sync: true) } }
+                    .controlSize(.small).disabled(store.busy || store.refreshing)
+            }
+            if store.syncing {
+                Text("Syncing…").font(.system(size: 12)).foregroundStyle(Palette.secondary)
+            } else if let run = store.lastSync {
+                ForEach(Array(store.syncNotes.enumerated()), id: \.offset) { _, n in
+                    Text(n.text).font(.system(size: 12)).foregroundStyle(n.color).fixedSize(horizontal: false, vertical: true)
+                }
+                Text("Last sync \(dateFormatter.string(from: run.at))").font(.system(size: 11)).foregroundStyle(Palette.secondary)
+            } else {
+                Text(store.autoSync ? "Syncs when the app opens and when you switch back to it."
+                                    : "Turn it on in Profiles… to sync each time the app opens.")
+                    .font(.system(size: 12)).foregroundStyle(Palette.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 10)
+        .background(Palette.card, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Palette.cardBorder))
+    }
+}
+
 struct Sidebar: View {
     @ObservedObject var store: Store
     @Binding var syncFilter: SyncFilter
@@ -434,6 +550,7 @@ struct Sidebar: View {
                     VStack(alignment: .leading, spacing: 8) {
                         SectionTitle(text: "Profiles")
                         ForEach(store.profiles) { ProfileCard(p: $0, color: store.color($0.key)) }
+                        SyncCard(store: store)
                         Text("To copy into a profile, quit its Claude app first.")
                             .font(.system(size: 12)).foregroundStyle(Palette.secondary).padding(.horizontal, 6)
                             .fixedSize(horizontal: false, vertical: true)
@@ -854,6 +971,7 @@ struct SettingsSheet: View {
     @ObservedObject var store: Store
     @State var show: [String]
     @State var names: [String: String]
+    @State var autoSync: Bool
     let onDone: () -> Void
 
     init(store: Store, onDone: @escaping () -> Void) {
@@ -861,6 +979,7 @@ struct SettingsSheet: View {
         self.onDone = onDone
         _show = State(initialValue: store.profiles.map(\.key))
         _names = State(initialValue: Dictionary(uniqueKeysWithValues: store.allProfiles.map { ($0.key, $0.name) }))
+        _autoSync = State(initialValue: store.autoSync)
     }
 
     var body: some View {
@@ -879,22 +998,31 @@ struct SettingsSheet: View {
                         .disabled(!show.contains(p.key) && show.count >= 3)
                         TextField(p.key, text: Binding(get: { names[p.key] ?? "" }, set: { names[p.key] = $0 }))
                             .textFieldStyle(.roundedBorder).frame(width: 160)
-                        Text(p.key == "default" ? "default Claude" : "claude-multiprofile: \(p.key)")
+                        Text(p.origin)
                             .foregroundStyle(Palette.secondary).frame(width: 190, alignment: .leading)
+                            .help("Claude Code folder: \(p.codeDir ?? "?")")
                         Text(p.email ?? "not signed in").foregroundStyle(Palette.secondary).lineLimit(1).truncationMode(.middle)
                     }
                 }
             }
             if store.allProfiles.count < 2 {
-                Text("Only one profile found. Create another with claude-multiprofile (Desktop and Code), sign in, then come back.")
+                Text("Only one profile found. Create another with claude-multiprofile, sign in, then come back.")
                     .foregroundStyle(Palette.amber).fixedSize(horizontal: false, vertical: true)
             }
+            Toggle(isOn: $autoSync) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Sync automatically when the app opens and when you switch back to it")
+                    Text("Chats missing from a selected profile are copied there, and older copies brought up to date, in every direction. Chats continued in two profiles, deleted or moved away are left alone, and nothing is written into a profile while its Claude app is open.")
+                        .foregroundStyle(Palette.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .toggleStyle(.checkbox)
             HStack {
                 Text("\(show.count) of 3 selected").foregroundStyle(Palette.secondary)
                 Spacer()
                 Button("Cancel", action: onDone).keyboardShortcut(.cancelAction)
                 Button("Save") {
-                    Task { await store.saveSettings(show: show, names: names); onDone() }
+                    Task { await store.saveSettings(show: show, names: names, autoSync: autoSync); onDone() }
                 }
                 .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent).tint(Palette.accent)
                 .disabled(show.count < 2)
@@ -986,13 +1114,20 @@ struct ContentView: View {
         .searchable(text: $search, placement: .toolbar, prompt: "Search title or folder")
         .toolbar {
             ToolbarItem {
-                Button { Task { await store.reload() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }
+                Button { Task { await store.refresh(sync: true) } } label: {
+                    Label("Sync now", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .help("Sync now: copy missing and older chats between the profiles")
+                .disabled(store.busy || store.refreshing)
+            }
+            ToolbarItem {
+                Button { Task { await store.refresh() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }
                     .help("Refresh")
             }
         }
-        .task { await store.reload() }
+        .task { await store.refresh() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            Task { await store.reload() }
+            Task { await store.refresh() }
         }
         .sheet(item: $store.confirming) { req in
             ConfirmSheet(request: req, onCancel: { store.confirming = nil },
