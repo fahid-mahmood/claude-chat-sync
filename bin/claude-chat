@@ -3,12 +3,15 @@
 
 A "profile" is one Claude Desktop data folder plus one Claude Code config folder:
 the default install (~/Library/Application Support/Claude + ~/.claude) and every
-profile made with claude-multiprofile that has both a Desktop and a Code half.
+profile made with claude-multiprofile that has a Desktop half. A Desktop-only profile
+runs its Code tab on the shared ~/.claude, so it shares the conversations themselves
+with the default profile and only the cards in its Code tab are its own.
 
   claude-chat profiles [--json]
   claude-chat list   --from P [TEXT] [--json]
   claude-chat status [--profiles P,Q,R] [--json]
   claude-chat copy   CHAT --from P --to Q [--move | --archive-source] [--solo] [--force] [--dry-run] [--json]
+  claude-chat sync   [--profiles P,Q,R] [--dry-run] [--json]
   claude-chat trash  list [--json] | restore ID
   claude-chat pending list [--json] | cancel SESSION_ID
 
@@ -17,6 +20,10 @@ its transcripts (<config>/projects/<folder>/<cli id>.jsonl and folder), its chec
 (<config>/file-history/<cli id>/) and, for multi-session work, the shared notes folder
 (<data>/side-session-notes/<session id>/). `copy` takes a chat together with all its
 sub-chats unless --solo is given, and can be run again to bring a copy up to date.
+`sync` does that for every chat of the shown profiles at once, in every direction, but
+only the safe part: it copies missing chats and updates copies that are behind, and
+leaves diverged chats, chats deleted or moved away in a profile, and profiles whose
+app is open alone.
 
 Writing into a profile needs its Claude app closed. Archiving or removing chats in a
 profile whose app is open is queued and applied as soon as that app is closed (on the
@@ -25,10 +32,11 @@ next claude-chat command). Removed chats go to a trash folder and can be restore
 These are internal, undocumented Claude formats: keep backups, and expect to update
 this tool when Claude changes them.
 """
-import argparse, glob, json, os, shutil, subprocess, sys, time
+import argparse, glob, json, os, re, shutil, subprocess, sys, time
 
 HOME = os.path.expanduser("~")
 SUPPORT = os.path.join(HOME, "Library/Application Support")
+DEFAULT_CODE_DIR = os.path.join(HOME, ".claude")
 MULTIPROFILE_REGISTRY = os.path.join(HOME, ".config/claude-multiprofile/profiles.json")
 CONFIG_DIR = os.path.join(HOME, ".config/claude-chat-sync")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
@@ -36,6 +44,7 @@ PENDING_FILE = os.path.join(CONFIG_DIR, "pending.json")
 DATA_DIR = os.path.join(HOME, ".local/share/claude-chat-sync")
 TRASH_DIR = os.path.join(DATA_DIR, "trash")
 COMPARE_CACHE = os.path.join(HOME, ".cache/claude-chat-sync/compare.json")
+ACCOUNTS_CACHE = os.path.join(HOME, ".cache/claude-chat-sync/accounts.json")
 
 # Fields that point at the source account or app instance: never copied across
 DROP_KEYS = ("bridgeSessionIds", "chromeTabGroupId", "remoteMcpServersConfig")
@@ -65,7 +74,7 @@ def read_json(path, default=None):
 
 def write_json(path, d):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = f"{path}.{os.getpid()}.tmp"  # per process: two runs at once must not share it
     with open(tmp, "w") as f:
         json.dump(d, f)
     os.chmod(tmp, 0o600)
@@ -74,33 +83,52 @@ def write_json(path, d):
 
 # ---------------------------------------------------------------- profiles
 
+def same_dir(a, b):
+    """Do two paths name the same folder? macOS folders are case-insensitive, and one may not exist yet."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.realpath(a).casefold() == os.path.realpath(b).casefold()
+
+
 def load_profiles():
     """Every usable profile, in order: default first, then claude-multiprofile, then config.json."""
     cfg = read_json(CONFIG_FILE, {}) or {}
     names = cfg.get("names", {})
     out = [{
-        "key": "default", "data": os.path.join(SUPPORT, "Claude"), "cfg": os.path.join(HOME, ".claude"),
-        "account_json": os.path.join(HOME, ".claude.json"), "udd": None, "color": None,
+        "key": "default", "data": os.path.join(SUPPORT, "Claude"), "cfg": DEFAULT_CODE_DIR,
+        "account_json": os.path.join(HOME, ".claude.json"), "own_code": True, "udd": None, "color": None,
+        "app": "Claude",
     }]
+
+    def add(key, data, code_dir, color, app):
+        if any(x["key"] == key for x in out):
+            return
+        clash = next((x for x in out if same_dir(x["data"], data)), None)
+        if clash:  # two names for one Desktop folder: syncing it with itself would be wrong
+            print(f"claude-chat: profile '{key}' ignored, it uses the Desktop folder of '{clash['key']}'", file=sys.stderr)
+            return
+        out.append({
+            # No Code folder of its own: its Code tab runs Claude Code on the shared ~/.claude
+            "key": key, "data": data, "cfg": code_dir or DEFAULT_CODE_DIR,
+            # Without one, its Code tab uses the Desktop's sign-in, whoever the shared one belongs to
+            "account_json": os.path.join(code_dir or HOME, ".claude.json"), "own_code": bool(code_dir),
+            "udd": data, "color": color, "app": app,
+        })
+
     reg = read_json(MULTIPROFILE_REGISTRY, {}) or {}
     for p in reg.get("profiles", []):
         desk, code = p.get("desktop") or {}, p.get("code") or {}
-        if not desk.get("dataDir") or not code.get("configDir"):
-            continue  # Desktop-only or Code-only profiles have no chats to move here
-        out.append({
-            "key": p["name"], "data": desk["dataDir"], "cfg": code["configDir"],
-            "account_json": os.path.join(code["configDir"], ".claude.json"),
-            "udd": desk["dataDir"], "color": desk.get("color"),
-        })
+        if p.get("name") and desk.get("dataDir"):  # Code-only profiles have no Code tab, so no chats here
+            launcher = os.path.basename(desk.get("appPath") or "").removesuffix(".app")
+            add(p["name"], desk["dataDir"], code.get("configDir"), desk.get("color"), launcher or None)
     for p in cfg.get("profiles", []):  # hand-made setups without claude-multiprofile
-        if p.get("key") and p.get("dataDir") and p.get("configDir") and all(x["key"] != p["key"] for x in out):
-            out.append({
-                "key": p["key"], "data": os.path.expanduser(p["dataDir"]), "cfg": os.path.expanduser(p["configDir"]),
-                "account_json": os.path.join(os.path.expanduser(p["configDir"]), ".claude.json"),
-                "udd": os.path.expanduser(p["dataDir"]), "color": p.get("color"),
-            })
+        if p.get("key") and p.get("dataDir"):
+            add(p["key"], os.path.expanduser(p["dataDir"]),
+                os.path.expanduser(p["configDir"]) if p.get("configDir") else None, p.get("color"), None)
     for p in out:
         p["name"] = names.get(p["key"], p["key"].capitalize() if p["key"] != "default" else "Default")
+        p["app"] = p["app"] or f"Claude {p['name']}"
     return out
 
 
@@ -113,7 +141,16 @@ def profile(key):
     return PROFILES[key]
 
 
+def code_shared(key):
+    """Does another profile use this profile's Claude Code folder? Its conversations then belong to both."""
+    return any(k != key and same_dir(p["cfg"], PROFILES[key]["cfg"]) for k, p in PROFILES.items())
+
+
 _ps_cache = None
+
+# Claude Desktop's main executable, ".../Contents/MacOS/Claude" and nothing longer: other apps whose
+# executable starts with "Claude" (this app's own ClaudeChatSync among them) are not a Claude
+CLAUDE_MAIN = re.compile(r"/Contents/MacOS/Claude(?= |$)")
 
 
 def app_running(key):
@@ -123,29 +160,52 @@ def app_running(key):
         fake = os.environ.get("CLAUDE_CHAT_PS_OUTPUT")  # tests: the process list to pretend
         _ps_cache = (fake if fake is not None else
                      subprocess.run(["ps", "-axww", "-o", "args="], capture_output=True, text=True).stdout).splitlines()
-    udd = PROFILES[key]["udd"]
+    p = PROFILES[key]
     for line in _ps_cache:
-        if "/Contents/MacOS/Claude" not in line or "--type=" in line:
+        if not CLAUDE_MAIN.search(line) or "--type=" in line:
             continue
-        if udd is None and "--user-data-dir=" not in line:
-            return True
-        if udd is not None and f"--user-data-dir={udd}" in line:
+        # ps shows arguments unquoted: the folder runs up to the next flag
+        udd = re.split(r" --| -psn_", line.split("--user-data-dir=", 1)[1])[0] if "--user-data-dir=" in line else None
+        if (udd is None and p["udd"] is None) or (udd is not None and same_dir(udd, p["data"])):
             return True
     return False
 
 
+_emails = None
+
+
+def known_emails():
+    """Account id -> e-mail. Claude Desktop keeps the e-mail only in its encrypted sign-in, so remember
+    every pair Claude shows us: a Claude Code sign-in, and the account a Desktop Code tab runs us with."""
+    global _emails
+    if _emails is None:
+        _emails = read_json(ACCOUNTS_CACHE, {}) or {}
+        seen = dict(_emails)
+        for p in PROFILES.values():
+            o = (read_json(p["account_json"], {}) or {}).get("oauthAccount") or {}
+            if o.get("accountUuid") and o.get("emailAddress"):
+                seen[o["accountUuid"]] = o["emailAddress"]
+        acct, email = os.environ.get("CLAUDE_CODE_ACCOUNT_UUID"), os.environ.get("CLAUDE_CODE_USER_EMAIL")
+        if acct and email:
+            seen[acct] = email
+        if seen != _emails:
+            write_json(ACCOUNTS_CACHE, seen)
+            _emails = seen
+    return _emails
+
+
 def account_info(key):
-    """The account Claude Desktop is signed in with, and the e-mail Claude Code knows for it."""
+    """The account Claude Desktop is signed in with, its e-mail if known, and the one Claude Code uses."""
     p = PROFILES[key]
     app_acct = (read_json(os.path.join(p["data"], "config.json"), {}) or {}).get("lastKnownAccountUuid")
     oauth = (read_json(p["account_json"], {}) or {}).get("oauthAccount") or {}
     code_acct, email = oauth.get("accountUuid"), oauth.get("emailAddress")
     return {
         "account": app_acct,
-        "email": email if code_acct and code_acct == app_acct else None,
-        "codeEmail": email,
+        "email": known_emails().get(app_acct) if app_acct else None,
+        "codeEmail": email if p["own_code"] else None,
         # Desktop and Code signed in with different accounts: chats would land in the wrong place
-        "accountMismatch": bool(app_acct and code_acct and app_acct != code_acct),
+        "accountMismatch": bool(p["own_code"] and app_acct and code_acct and app_acct != code_acct),
     }
 
 
@@ -276,6 +336,8 @@ def compare(pa, pb, cache=None):
     """State of a against b: same, newer (a is further along), older, diverged, missing."""
     if not pa or not pb or not os.path.exists(pa) or not os.path.exists(pb):
         return "missing"
+    if os.path.samefile(pa, pb):  # profiles sharing one Claude Code folder
+        return "same"
     sa, sb = os.stat(pa), os.stat(pb)
     key = f"{pa}|{sa.st_size}|{sa.st_mtime_ns}|{pb}|{sb.st_size}|{sb.st_mtime_ns}"
     if cache is not None and key in cache:
@@ -377,8 +439,11 @@ def trash_chat(key, rec):
             shutil.move(src, dst)
             moves.append({"from": src, "to": dst})
 
+    # A Claude Code folder shared with another profile holds that profile's conversation too:
+    # only the card leaves, the conversation stays where the other profile reads it
+    shared = code_shared(key)
     move(rec["_file"])
-    if rec.get("cwd"):
+    if rec.get("cwd") and not shared:
         proj = project_dir(p["cfg"], rec["cwd"])
         for cli in cli_ids(rec):
             move(os.path.join(proj, cli + ".jsonl"))
@@ -388,9 +453,10 @@ def trash_chat(key, rec):
     set_archived_idx(sess, rec["sessionId"], False)
 
     # The tombstone Claude writes when you delete a chat: keeps its session recovery
-    # from bringing the transcript back
+    # from bringing the transcript back. Not for a shared conversation, which another
+    # profile still uses: a deleted chat's conversation is not Claude's to keep
     tombstones = []
-    for cli in cli_ids(rec):
+    for cli in ([] if shared else cli_ids(rec)):
         t = os.path.join(sess, f"deleted_{cli}")
         if not os.path.exists(t):
             with open(t, "w") as f:
@@ -454,15 +520,17 @@ def copy_tree(src, dst):
         shutil.copytree(src, dst, dirs_exist_ok=True)
 
 
-def copy_chat(rec, src, dst, state):
+def copy_chat(rec, src, dst, state, archived=False):
+    """Copy one chat; a card new to the destination starts archived or not as `archived` says."""
     cwd = rec["cwd"]
     sp, dp = PROFILES[src], PROFILES[dst]
     sproj, dproj = project_dir(sp["cfg"], cwd), project_dir(dp["cfg"], cwd)
-    os.makedirs(dproj, exist_ok=True)
-    for i, cli in enumerate(cli_ids(rec)):
+    # Profiles sharing one Claude Code folder already share the conversations: only the card is copied
+    for i, cli in enumerate([] if same_dir(sp["cfg"], dp["cfg"]) else cli_ids(rec)):
         sj, dj = os.path.join(sproj, cli + ".jsonl"), os.path.join(dproj, cli + ".jsonl")
         if not os.path.exists(sj):
             continue
+        os.makedirs(dproj, exist_ok=True)
         if i == 0:
             if state == "diverged" and os.path.exists(dj):
                 shutil.copy2(dj, f"{dj}.bak-{TS}")
@@ -489,8 +557,8 @@ def copy_chat(rec, src, dst, state):
                 new[k] = old[k]
         new["isArchived"] = bool(old.get("isArchived"))
     else:
-        new["isArchived"] = False
-        set_archived_idx(dsess, rec["sessionId"], False)
+        new["isArchived"] = archived
+        set_archived_idx(dsess, rec["sessionId"], archived)
     write_json(out, new)
 
 
@@ -571,7 +639,8 @@ def chat_json(key, r, idx, pending, sync=None, peer=None):
 
 def profile_json(key):
     p = PROFILES[key]
-    d = {"key": key, "name": p["name"], "color": p["color"], "running": app_running(key)}
+    d = {"key": key, "name": p["name"], "color": p["color"], "running": app_running(key), "appName": p["app"],
+         "codeDir": p["cfg"].replace(HOME, "~")}
     d.update(account_info(key))
     return d
 
@@ -635,25 +704,26 @@ def relate(paths):
 _cache = {}
 
 
-def cmd_status(a):
-    global _cache
+def picked_profiles(a):
     keys = a.profiles.split(",") if a.profiles else shown_profiles()
     for k in keys:
         profile(k)
-    apply_pending()
-    _cache = read_json(COMPARE_CACHE, {}) or {}
-    pending = load_pending()
-    out = {"profiles": [], "chats": []}
-    snaps = {}
+    return keys
+
+
+def snapshot(keys):
+    """Each readable profile's (chats, archive index), and the profiles that can't be read, with why."""
+    snaps, errors = {}, {}
     for k in keys:
-        info = profile_json(k)
         try:
             snaps[k] = (load_records(k), read_idx(sessions_dir(k)))
         except ToolError as e:
-            info["error"] = e.msg
-        out["profiles"].append(info)
+            errors[k] = e.msg
+    return snaps, errors
 
-    # One row per chat, matched across profiles by session id (copies keep it), else by transcript id
+
+def match_rows(snaps):
+    """One row per chat, matched across profiles by session id (copies keep it), else by transcript id."""
     rows, by_sid, by_cli = [], {}, {}
     for k, (recs, idx) in snaps.items():
         for r in recs:
@@ -666,12 +736,27 @@ def cmd_status(a):
             by_sid.setdefault(r["sessionId"], row)
             if r.get("cliSessionId"):
                 by_cli.setdefault(r["cliSessionId"], row)
-
-    alias = {}
     for row in rows:
         row["key"] = next(iter(row["recs"].values()))["sessionId"]
-        for r in row["recs"].values():
-            alias[r["sessionId"]] = row["key"]
+    return rows
+
+
+def cmd_status(a):
+    global _cache
+    keys = picked_profiles(a)
+    apply_pending()
+    _cache = read_json(COMPARE_CACHE, {}) or {}
+    pending = load_pending()
+    out = {"profiles": [], "chats": []}
+    snaps, errors = snapshot(keys)
+    for k in keys:
+        info = profile_json(k)
+        if k in errors:
+            info["error"] = errors[k]
+        out["profiles"].append(info)
+
+    rows = match_rows(snaps)
+    alias = {r["sessionId"]: row["key"] for row in rows for r in row["recs"].values()}
     for row in rows:
         recs = row["recs"]
         newest = max(recs.values(), key=lambda r: r.get("lastActivityAt") or 0)
@@ -704,6 +789,99 @@ def cmd_status(a):
         counts[kind] = counts.get(kind, 0) + 1
     for kind, n in sorted(counts.items()):
         print(f"   {kind}: {n}")
+
+
+def cmd_sync(a):
+    """Give every shown profile every chat: copy the missing ones, update the copies that are behind.
+
+    Only what loses nothing: a diverged chat, a chat deleted in a profile (Claude's tombstone) or moved
+    away from it (our trash), and any profile whose app is open are left alone and reported.
+    """
+    global _cache
+    keys = picked_profiles(a)
+    if len(keys) < 2:
+        die("sync needs at least two profiles")
+    apply_pending()
+    _cache = read_json(COMPARE_CACHE, {}) or {}
+    snaps, errors = snapshot(keys)
+    rows = match_rows(snaps)
+    moved = {(e["profile"], e["sessionId"]) for e in trash_entries()}
+    present = {k: {r["sessionId"] for r in recs} for k, (recs, _) in snaps.items()}
+    deleted = {k: {os.path.basename(f).removeprefix("deleted_") for f in glob.glob(os.path.join(sessions_dir(k), "deleted_*"))}
+               for k in snaps}
+    is_open = {k: app_running(k) for k in snaps}
+
+    # Parents first, so a sub-chat is only copied where its parent is
+    parent = {r["sessionId"]: parent_of(r) for row in rows for r in row["recs"].values()}
+
+    def depth(sid):
+        d, seen = 0, set()
+        while parent.get(sid) and sid not in seen:
+            seen.add(sid)
+            sid, d = parent[sid], d + 1
+        return d
+    rows.sort(key=lambda row: depth(row["key"]))
+
+    results = []
+    for row in rows:
+        recs = row["recs"]
+        rel = relate({k: transcript(k, r) for k, r in recs.items()})
+        newest = max(recs.values(), key=lambda r: r.get("lastActivityAt") or 0)
+        if "diverged" in rel.values():
+            results.append({"sessionId": newest["sessionId"], "title": newest.get("title"), "from": None, "to": None,
+                            "result": "conflict"})
+            continue
+        sources = [k for k in recs if rel.get(k) in ("same", "latest")]
+        if not sources:
+            continue  # no saved conversation anywhere: nothing to copy
+        src = max(sources, key=lambda k: recs[k].get("lastActivityAt") or 0)
+        rec = recs[src]
+        for t in snaps:
+            if t == src:
+                continue
+            have = recs.get(t)
+            if have is not None:
+                if rel.get(t) not in ("behind", "missing"):
+                    continue  # already as far along
+                state = "newer" if rel[t] == "behind" else "new"
+                result = "updated"
+                if have["sessionId"] != rec["sessionId"]:
+                    result = "mismatch"  # the same conversation under another card: leave it
+            elif any(c in deleted[t] for c in cli_ids(rec)):
+                result = "deleted"
+            elif (t, rec["sessionId"]) in moved:
+                result = "moved"
+            else:
+                state, result = "new", "copied"
+            if result in ("copied", "updated"):
+                if is_open[t]:
+                    result = "waiting"
+                elif have is None and parent_of(rec) and parent_of(rec) not in present[t]:
+                    result = "parent"  # it would land there on its own, without the chat it came from
+                elif not a.dry_run:
+                    copy_chat(rec, src, t, state, archived=is_archived(rec, snaps[src][1]))
+                if result in ("copied", "updated", "waiting"):
+                    present[t].add(rec["sessionId"])  # its sub-chats can follow
+            results.append({"sessionId": rec["sessionId"], "title": rec.get("title"), "from": src, "to": t,
+                            "result": result})
+    write_json(COMPARE_CACHE, _cache)
+
+    if a.json:
+        json.dump({"dryRun": a.dry_run, "profiles": list(snaps), "errors": errors, "chats": results}, sys.stdout)
+        return
+    for k, msg in errors.items():
+        print(f"{k}: not synced, {msg}")
+    label = {"copied": "copied", "updated": "updated", "waiting": "waiting: its Claude app is open",
+             "conflict": "SKIPPED: continued in more than one profile", "deleted": "skipped: deleted there",
+             "moved": "skipped: moved away from there", "parent": "skipped: its parent chat is not there",
+             "mismatch": "skipped: the same conversation is there under another card"}
+    for x in results:
+        where = f"{x['from']} -> {x['to']}" if x["to"] else "everywhere"
+        print(f"{where:<24} «{x['title']}»: {label[x['result']]}")
+    if not results:
+        print("Everything is in sync.")
+    elif a.dry_run:
+        print("(dry run, nothing changed)")
 
 
 def cmd_trash(a):
@@ -759,6 +937,10 @@ def main():
     c.add_argument("--force", action="store_true", help="replace diverged versions in the destination (backup kept)")
     c.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
     c.add_argument("--json", action="store_true")
+    sy = sub.add_parser("sync", help="copy every missing or older chat across the shown profiles, both ways")
+    sy.add_argument("--profiles", help="comma-separated profile keys (default: config.json \"show\", else the first 3)")
+    sy.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
+    sy.add_argument("--json", action="store_true")
     t = sub.add_parser("trash", help="chats removed by --move")
     tsub = t.add_subparsers(dest="trash_cmd", required=True)
     tl = tsub.add_parser("list")
@@ -773,7 +955,7 @@ def main():
     pc.add_argument("session_id")
     a = p.parse_args()
     try:
-        {"profiles": cmd_profiles, "list": cmd_list, "status": cmd_status, "copy": cmd_copy,
+        {"profiles": cmd_profiles, "list": cmd_list, "status": cmd_status, "copy": cmd_copy, "sync": cmd_sync,
          "trash": cmd_trash, "pending": cmd_pending}[a.cmd](a)
     except ToolError as e:
         print(f"ERROR: {e.msg}", file=sys.stderr)
