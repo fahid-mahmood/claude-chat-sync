@@ -44,6 +44,7 @@ PENDING_FILE = os.path.join(CONFIG_DIR, "pending.json")
 DATA_DIR = os.path.join(HOME, ".local/share/claude-chat-sync")
 TRASH_DIR = os.path.join(DATA_DIR, "trash")
 COMPARE_CACHE = os.path.join(HOME, ".cache/claude-chat-sync/compare.json")
+ACCOUNTS_CACHE = os.path.join(HOME, ".cache/claude-chat-sync/accounts.json")
 
 # Fields that point at the source account or app instance: never copied across
 DROP_KEYS = ("bridgeSessionIds", "chromeTabGroupId", "remoteMcpServersConfig")
@@ -170,15 +171,38 @@ def app_running(key):
     return False
 
 
+_emails = None
+
+
+def known_emails():
+    """Account id -> e-mail. Claude Desktop keeps the e-mail only in its encrypted sign-in, so remember
+    every pair Claude shows us: a Claude Code sign-in, and the account a Desktop Code tab runs us with."""
+    global _emails
+    if _emails is None:
+        _emails = read_json(ACCOUNTS_CACHE, {}) or {}
+        seen = dict(_emails)
+        for p in PROFILES.values():
+            o = (read_json(p["account_json"], {}) or {}).get("oauthAccount") or {}
+            if o.get("accountUuid") and o.get("emailAddress"):
+                seen[o["accountUuid"]] = o["emailAddress"]
+        acct, email = os.environ.get("CLAUDE_CODE_ACCOUNT_UUID"), os.environ.get("CLAUDE_CODE_USER_EMAIL")
+        if acct and email:
+            seen[acct] = email
+        if seen != _emails:
+            write_json(ACCOUNTS_CACHE, seen)
+            _emails = seen
+    return _emails
+
+
 def account_info(key):
-    """The account Claude Desktop is signed in with, and the e-mail Claude Code knows for it."""
+    """The account Claude Desktop is signed in with, its e-mail if known, and the one Claude Code uses."""
     p = PROFILES[key]
     app_acct = (read_json(os.path.join(p["data"], "config.json"), {}) or {}).get("lastKnownAccountUuid")
     oauth = (read_json(p["account_json"], {}) or {}).get("oauthAccount") or {}
     code_acct, email = oauth.get("accountUuid"), oauth.get("emailAddress")
     return {
         "account": app_acct,
-        "email": email if code_acct and code_acct == app_acct else None,
+        "email": known_emails().get(app_acct) if app_acct else None,
         "codeEmail": email if p["own_code"] else None,
         # Desktop and Code signed in with different accounts: chats would land in the wrong place
         "accountMismatch": bool(p["own_code"] and app_acct and code_acct and app_acct != code_acct),

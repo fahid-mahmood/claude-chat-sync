@@ -186,6 +186,12 @@ Claude Chat Sync stores only its own settings (`~/.config/claude-chat-sync`), it
 (`~/.local/share/claude-chat-sync`) and a comparison cache (`~/.cache/claude-chat-sync`). It never reads or
 writes the Keychain, never contacts the network, and never touches a profile's sign-in.
 
+Claude Desktop keeps a profile's e-mail only in its encrypted sign-in, so the e-mail shown for a profile is
+one Claude has given Claude Chat Sync: from a Claude Code sign-in (`.claude.json`), or from the account a
+Desktop Code tab passes to the commands it runs. Each pair it sees is remembered in
+`~/.cache/claude-chat-sync/accounts.json`. Until it has seen one, a profile shows its account number
+instead; running `claude-chat profiles` once in that profile's Code tab fills it in.
+
 ## Development
 
 ```bash

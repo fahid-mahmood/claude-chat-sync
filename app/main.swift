@@ -71,6 +71,8 @@ struct ProfileInfo: Decodable, Identifiable, Hashable {
     var id: String { key }
 
     var app: String { appName ?? (key == "default" ? "Claude" : "Claude \(name)") }
+    /// Who the Desktop is signed in as: the e-mail is only known when Claude Code uses the same account
+    var signedInAs: String { email ?? account.map { "account \($0.prefix(8))" } ?? "not signed in" }
     var origin: String {
         if key == "default" { return "default Claude" }
         return "claude-multiprofile: \(key)" + (codeDir == "~/.claude" ? " · Desktop only" : "")
@@ -987,7 +989,7 @@ struct SettingsSheet: View {
             Text("Profiles").font(.system(size: 17, weight: .semibold))
             Text("Profiles come from claude-multiprofile, plus your default Claude. Pick up to three to compare, and give them names you recognise.")
                 .foregroundStyle(Color(hex: 0xC7C7CD)).fixedSize(horizontal: false, vertical: true)
-            VStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 8) {
                 ForEach(store.allProfiles) { p in
                     HStack(spacing: 12) {
                         Toggle("", isOn: Binding(
@@ -1001,7 +1003,8 @@ struct SettingsSheet: View {
                         Text(p.origin)
                             .foregroundStyle(Palette.secondary).frame(width: 190, alignment: .leading)
                             .help("Claude Code folder: \(p.codeDir ?? "?")")
-                        Text(p.email ?? "not signed in").foregroundStyle(Palette.secondary).lineLimit(1).truncationMode(.middle)
+                        Text(p.signedInAs).foregroundStyle(Palette.secondary).lineLimit(1).truncationMode(.middle)
+                            .help(p.accountMismatch ? "Claude Code in the terminal is signed in as \(p.codeEmail ?? "another account")" : "")
                     }
                 }
             }

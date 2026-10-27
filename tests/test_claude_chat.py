@@ -67,10 +67,12 @@ class Home:
         self.write_abs(os.path.join(self.sessions(name), sid + ".json"), rec)
         self.write_abs(self.transcript(name, cwd, cli), text)
 
-    def run(self, *args, ok=True):
+    def run(self, *args, ok=True, env_extra=None):
         ps = "\n".join([APP if n == "default" else f"{APP} --user-data-dir={self.profiles[n][0]}"
                         for n in self.open_apps] + self.other_processes)
-        env = dict(os.environ, HOME=self.root, CLAUDE_CHAT_PS_OUTPUT=ps)
+        # Not the account of a Claude Code tab these tests may run in
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_CODE_")}
+        env.update(HOME=self.root, CLAUDE_CHAT_PS_OUTPUT=ps, **(env_extra or {}))
         r = subprocess.run(["/usr/bin/python3", "-I", TOOL, *args], capture_output=True, text=True, env=env)
         if ok and r.returncode != 0:
             raise AssertionError(f"{args} failed ({r.returncode}): {r.stderr}")
@@ -306,6 +308,14 @@ class DesktopOnlyTest(unittest.TestCase):
         self.assertFalse(ps["work"]["accountMismatch"])  # the shared Code sign-in is the default profile's
         self.assertEqual(ps["work"]["account"], "acct-work")
         self.assertIsNone(ps["work"]["email"])
+
+    def test_email_learned_from_a_desktop_code_tab_is_remembered(self):
+        # Run once from inside the work profile's Code tab, which gives its account and e-mail
+        self.h.run("profiles", env_extra={"CLAUDE_CODE_ACCOUNT_UUID": "acct-work",
+                                          "CLAUDE_CODE_USER_EMAIL": "me@work.example"})
+        ps = {p["key"]: p for p in self.h.json("profiles")}
+        self.assertEqual(ps["work"]["email"], "me@work.example")
+        self.assertEqual(ps["default"]["email"], "default@example.com")
 
     def test_copy_and_move_only_move_the_card(self):
         h = self.h
